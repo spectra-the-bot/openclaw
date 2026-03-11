@@ -1,0 +1,34 @@
+--- a/dist/reply-DeXK9BLT.js
++++ b/dist/reply-DeXK9BLT.js
+@@ -61787,6 +61787,31 @@
+ 			fallbackModel,
+ 			result
+ 		});
++		const usage = result.meta.agentMeta?.usage;
++		if (sessionKey && isDiagnosticsEnabled(cfg) && hasNonzeroUsage(usage)) {
++			const input = usage.input ?? 0;
++			const output = usage.output ?? 0;
++			const cacheRead = usage.cacheRead ?? 0;
++			const cacheWrite = usage.cacheWrite ?? 0;
++			const promptTokens = input + cacheRead + cacheWrite;
++			const totalTokens = usage.total ?? promptTokens + output;
++			emitDiagnosticEvent({
++				type: "model.usage",
++				sessionKey,
++				sessionId,
++				provider: result.meta.agentMeta?.provider ?? fallbackProvider ?? provider,
++				model: result.meta.agentMeta?.model ?? fallbackModel ?? model,
++				usage: {
++					input,
++					output,
++					cacheRead,
++					cacheWrite,
++					promptTokens,
++					total: totalTokens
++				},
++				lastCallUsage: result.meta.agentMeta?.lastCallUsage
++			});
++		}
+ 		const payloads = result.payloads ?? [];
+ 		return await deliverAgentCommandResult({
+ 			cfg,
