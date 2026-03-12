@@ -330,7 +330,12 @@ export async function dispatchCronDelivery(
           })
         : undefined;
     const hadDescendants = activeSubagentRuns > 0 || Boolean(completedDescendantReply);
-    if (activeSubagentRuns > 0 || expectedSubagentFollowup) {
+    // Skip waiting for descendant subagents when bestEffort delivery is configured.
+    // bestEffort crons (e.g. orchestrators that spawn parallel workers) have already
+    // delivered their own summary and don't need to wait for workers to complete.
+    // Waiting for descendants in these cases blocks the cron for the full timeoutMs
+    // budget even though the orchestrator's own work is done. (#42482-followup)
+    if (!params.deliveryBestEffort && (activeSubagentRuns > 0 || expectedSubagentFollowup)) {
       let finalReply = await waitForDescendantSubagentSummary({
         sessionKey: params.agentSessionKey,
         initialReply: initialSynthesizedText,
@@ -358,10 +363,12 @@ export async function dispatchCronDelivery(
       synthesizedText = completedDescendantReply;
       deliveryPayloads = [{ text: completedDescendantReply }];
     }
-    if (activeSubagentRuns > 0) {
+    if (!params.deliveryBestEffort && activeSubagentRuns > 0) {
       // Parent orchestration is still in progress; avoid announcing a partial
       // update to the main requester. Mark deliveryAttempted so the timer does
       // not fire a redundant enqueueSystemEvent fallback (double-announce bug).
+      // Skip this gate for bestEffort delivery: the orchestrator has its own
+      // summary ready and workers report independently. (#42482-followup)
       deliveryAttempted = true;
       return params.withRunSession({
         status: "ok",
