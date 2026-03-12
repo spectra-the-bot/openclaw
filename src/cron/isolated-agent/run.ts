@@ -620,7 +620,7 @@ export async function runCronIsolatedAgentTurn(params: {
               config: cfgWithAgentDefaults,
               skillsSnapshot,
               prompt: promptText,
-              lane: params.lane ?? "cron",
+              lane: resolveNestedAgentLane(params.lane),
               provider: providerOverride,
               model: modelOverride,
               authProfileId,
@@ -746,7 +746,11 @@ export async function runCronIsolatedAgentTurn(params: {
     return withRunSession({ status: "error", error: String(err) });
   }
 
-  if (isAborted()) {
+  // Only abort-early if the session produced no result.
+  // If runResult is set (work completed before the timeout), proceed — the timeout
+  // may have fired during cleanup after the actual job work was already done.
+  // (#42482-followup: prefer completed result over abort signal)
+  if (isAborted() && !runResult) {
     return withRunSession({ status: "error", error: abortReason() });
   }
   if (!runResult) {
@@ -819,9 +823,9 @@ export async function runCronIsolatedAgentTurn(params: {
     await persistSessionEntry();
   }
 
-  if (isAborted()) {
-    return withRunSession({ status: "error", error: abortReason(), ...telemetry });
-  }
+  // Even if aborted after persistSessionEntry(), we have payloads — proceed to delivery.
+  // Delivery will be skipped if the channel is closed, but we can still return status:ok.
+  // (#42482-followup)
   const firstText = payloads[0]?.text ?? "";
   let summary = pickSummaryFromPayloads(payloads) ?? pickSummaryFromOutput(firstText);
   let outputText = pickLastNonEmptyTextFromPayloads(payloads);
