@@ -1226,7 +1226,7 @@ async function agentCommandInternal(
         type: "model.usage",
         sessionKey: sessionKey ?? sessionId,
         sessionId,
-        channel: messageChannel?.channel,
+        channel: messageChannel,
         provider: providerUsed,
         model: modelUsed,
         usage: {
