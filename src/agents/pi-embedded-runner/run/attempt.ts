@@ -1711,6 +1711,7 @@ export async function runEmbeddedAttempt(
     let sessionManager: ReturnType<typeof guardSessionManager> | undefined;
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
     let removeToolResultContextGuard: (() => void) | undefined;
+    let earlyPromptError = false;
     try {
       await repairSessionFileIfNeeded({
         sessionFile: params.sessionFile,
@@ -2484,6 +2485,7 @@ export async function runEmbeddedAttempt(
           } else {
             promptError = err;
             promptErrorSource = "prompt";
+            earlyPromptError = true;
           }
         } finally {
           log.debug(
@@ -2535,6 +2537,7 @@ export async function runEmbeddedAttempt(
             if (!promptError) {
               promptError = err;
               promptErrorSource = "compaction";
+              earlyPromptError = true;
             }
             if (!isProbeSession) {
               log.debug(
@@ -2797,11 +2800,19 @@ export async function runEmbeddedAttempt(
       // synthetic "missing tool result" errors and causing silent agent failures.
       // See: https://github.com/openclaw/openclaw/issues/8643
       removeToolResultContextGuard?.();
-      await flushPendingToolResultsAfterIdle({
-        agent: session?.agent,
-        sessionManager,
-        clearPendingOnTimeout: true,
-      });
+      if (earlyPromptError) {
+        // Early prompt-level failure: the agent never ran a meaningful turn, so
+        // waitForIdle() would block for the full 30s timeout (the agent is already
+        // aborted/errored and will never become idle). Skip the idle wait and just
+        // clear any pending tool results directly to avoid a 30s × N-retries wedge.
+        sessionManager?.clearPendingToolResults?.();
+      } else {
+        await flushPendingToolResultsAfterIdle({
+          agent: session?.agent,
+          sessionManager,
+          clearPendingOnTimeout: true,
+        });
+      }
       session?.dispose();
       releaseWsSession(params.sessionId);
       await sessionLock.release();
