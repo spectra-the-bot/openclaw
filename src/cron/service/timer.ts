@@ -1172,7 +1172,10 @@ export async function executeJobCore(
     abortSignal,
   });
 
-  if (abortSignal?.aborted) {
+  // If the session completed with ok status, prefer that over the abort signal.
+  // The execution timeout may have fired during cleanup after the real work finished,
+  // causing abortSignal.aborted to be true even though the job succeeded. (#42482-followup)
+  if (abortSignal?.aborted && res.status !== "ok") {
     return { status: "error", error: timeoutErrorMessage() };
   }
 
