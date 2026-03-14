@@ -634,6 +634,12 @@ export async function runCronIsolatedAgentTurn(params: {
               requireExplicitMessageTarget: toolPolicy.requireExplicitMessageTarget,
               disableMessageTool: toolPolicy.disableMessageTool,
               allowTransientCooldownProbe: runOptions?.allowTransientCooldownProbe,
+              fastMode: resolveFastModeState({
+                cfg: cfgWithAgentDefaults,
+                provider: providerOverride,
+                model: modelOverride,
+                sessionEntry: cronSession.sessionEntry,
+              }).enabled,
               abortSignal: attemptAbort.signal,
               bootstrapPromptWarningSignaturesSeen,
               bootstrapPromptWarningSignature,
@@ -645,50 +651,6 @@ export async function runCronIsolatedAgentTurn(params: {
           } finally {
             abortSignal?.removeEventListener("abort", onParentAbort);
           }
-          const result = await runEmbeddedPiAgent({
-            sessionId: cronSession.sessionEntry.sessionId,
-            sessionKey: agentSessionKey,
-            agentId,
-            trigger: "cron",
-            // Cron jobs are trusted local automation, so isolated runs should
-            // inherit owner-only tooling like local `openclaw agent` runs.
-            senderIsOwner: true,
-            messageChannel,
-            agentAccountId: resolvedDelivery.accountId,
-            sessionFile,
-            agentDir,
-            workspaceDir,
-            config: cfgWithAgentDefaults,
-            skillsSnapshot,
-            prompt: promptText,
-            lane: resolveNestedAgentLane(params.lane),
-            provider: providerOverride,
-            model: modelOverride,
-            authProfileId,
-            authProfileIdSource,
-            thinkLevel,
-            fastMode: resolveFastModeState({
-              cfg: cfgWithAgentDefaults,
-              provider: providerOverride,
-              model: modelOverride,
-              sessionEntry: cronSession.sessionEntry,
-            }).enabled,
-            verboseLevel: resolvedVerboseLevel,
-            timeoutMs,
-            bootstrapContextMode: agentPayload?.lightContext ? "lightweight" : undefined,
-            bootstrapContextRunKind: "cron",
-            runId: cronSession.sessionEntry.sessionId,
-            requireExplicitMessageTarget: toolPolicy.requireExplicitMessageTarget,
-            disableMessageTool: toolPolicy.disableMessageTool,
-            allowTransientCooldownProbe: runOptions?.allowTransientCooldownProbe,
-            abortSignal,
-            bootstrapPromptWarningSignaturesSeen,
-            bootstrapPromptWarningSignature,
-          });
-          bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
-            result.meta?.systemPromptReport,
-          );
-          return result;
         },
       });
       runResult = fallbackResult.result;
