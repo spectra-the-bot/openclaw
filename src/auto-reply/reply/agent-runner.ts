@@ -486,6 +486,82 @@ export async function runReplyAgent(params: {
       cliSessionId,
     });
 
+    // Issue D fix: also emit when lastCallUsage or promptTokens snapshot is non-zero — providers
+    // that omit aggregate `usage` but supply a lastCallUsage or promptTokens snapshot must not
+    // be silently dropped from telemetry.
+    const lastCallUsageSnap = runResult.meta?.agentMeta?.lastCallUsage;
+    const hasPromptTokensSnap =
+      typeof promptTokens === "number" && Number.isFinite(promptTokens) && promptTokens > 0;
+    if (
+      isDiagnosticsEnabled(cfg) &&
+      (hasNonzeroUsage(usage) || lastCallUsageSnap != null || hasPromptTokensSnap)
+    ) {
+      const input = usage?.input ?? 0;
+      const output = usage?.output ?? 0;
+      const cacheRead = usage?.cacheRead ?? 0;
+      const cacheWrite = usage?.cacheWrite ?? 0;
+      // Accumulated prompt tokens derived from usage (may overstate after tool loops/compaction).
+      const accumulatedPromptTokens = input + cacheRead + cacheWrite;
+      // Issue E fix: prefer the last-call/promptTokens snapshot for context.used, consistent
+      // with session-usage.ts:100-143. The accumulated totalTokens overstates context size
+      // after tool loops or compaction retries.
+      const lastCallInput = lastCallUsageSnap?.input ?? 0;
+      const lastCallOutput = lastCallUsageSnap?.output ?? 0;
+      const lastCallCacheRead = lastCallUsageSnap?.cacheRead ?? 0;
+      const lastCallCacheWrite = lastCallUsageSnap?.cacheWrite ?? 0;
+      const lastCallPromptTokens =
+        lastCallUsageSnap?.total ??
+        (lastCallUsageSnap ? lastCallInput + lastCallCacheRead + lastCallCacheWrite : undefined);
+      const contextUsed = lastCallPromptTokens ?? promptTokens ?? accumulatedPromptTokens;
+      // Issue F fix (agent-runner): when `usage` is absent/zero but `lastCallUsage` has real
+      // counts, derive emitted promptTokens and total from lastCallUsage so OTEL token metrics
+      // are non-zero for providers that supply per-call snapshots but omit aggregate totals.
+      const emittedPromptTokens =
+        promptTokens ??
+        (accumulatedPromptTokens > 0
+          ? accumulatedPromptTokens
+          : lastCallInput + lastCallCacheRead + lastCallCacheWrite > 0
+            ? lastCallInput + lastCallCacheRead + lastCallCacheWrite
+            : 0);
+      const totalTokens =
+        usage?.total ??
+        lastCallUsageSnap?.total ??
+        (emittedPromptTokens + output > 0
+          ? emittedPromptTokens + output
+          : lastCallInput + lastCallCacheRead + lastCallCacheWrite + lastCallOutput > 0
+            ? lastCallInput + lastCallCacheRead + lastCallCacheWrite + lastCallOutput
+            : undefined);
+      const costConfig = resolveModelCostConfig({
+        provider: providerUsed,
+        model: modelUsed,
+        config: cfg,
+      });
+      const costUsd = estimateUsageCost({ usage, cost: costConfig });
+      emitDiagnosticEvent({
+        type: "model.usage",
+        sessionKey,
+        sessionId: followupRun.run.sessionId,
+        channel: replyToChannel,
+        provider: providerUsed,
+        model: modelUsed,
+        usage: {
+          input,
+          output,
+          cacheRead,
+          cacheWrite,
+          promptTokens: emittedPromptTokens,
+          total: totalTokens,
+        },
+        lastCallUsage: lastCallUsageSnap,
+        context: {
+          limit: contextTokensUsed,
+          used: contextUsed,
+        },
+        costUsd,
+        durationMs: Date.now() - runStartedAt,
+      });
+    }
+
     // Drain any late tool/block deliveries before deciding there's "nothing to send".
     // Otherwise, a late typing trigger (e.g. from a tool callback) can outlive the run and
     // keep the typing indicator stuck.
@@ -544,44 +620,6 @@ export async function runReplyAgent(params: {
         : replyPayloads;
 
     await signalTypingIfNeeded(guardedReplyPayloads, typingSignals);
-
-    if (isDiagnosticsEnabled(cfg) && hasNonzeroUsage(usage)) {
-      const input = usage.input ?? 0;
-      const output = usage.output ?? 0;
-      const cacheRead = usage.cacheRead ?? 0;
-      const cacheWrite = usage.cacheWrite ?? 0;
-      const promptTokens = input + cacheRead + cacheWrite;
-      const totalTokens = usage.total ?? promptTokens + output;
-      const costConfig = resolveModelCostConfig({
-        provider: providerUsed,
-        model: modelUsed,
-        config: cfg,
-      });
-      const costUsd = estimateUsageCost({ usage, cost: costConfig });
-      emitDiagnosticEvent({
-        type: "model.usage",
-        sessionKey,
-        sessionId: followupRun.run.sessionId,
-        channel: replyToChannel,
-        provider: providerUsed,
-        model: modelUsed,
-        usage: {
-          input,
-          output,
-          cacheRead,
-          cacheWrite,
-          promptTokens,
-          total: totalTokens,
-        },
-        lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
-        context: {
-          limit: contextTokensUsed,
-          used: totalTokens,
-        },
-        costUsd,
-        durationMs: Date.now() - runStartedAt,
-      });
-    }
 
     const responseUsageRaw =
       activeSessionEntry?.responseUsage ??

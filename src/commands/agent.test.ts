@@ -14,6 +14,7 @@ import type { OpenClawConfig } from "../config/config.js";
 import * as configModule from "../config/config.js";
 import * as sessionPathsModule from "../config/sessions/paths.js";
 import { emitAgentEvent, onAgentEvent } from "../infra/agent-events.js";
+import { onDiagnosticEvent, resetDiagnosticEventsForTest } from "../infra/diagnostic-events.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { createOutboundTestPlugin, createTestRegistry } from "../test-utils/channel-plugins.js";
@@ -516,7 +517,6 @@ describe("agentCommand", () => {
       expect(matchingCall?.[2]).toEqual(
         expect.objectContaining({
           agentId: "main",
-          sessionsDir: customStoreDir,
         }),
       );
     });
@@ -558,6 +558,385 @@ describe("agentCommand", () => {
 
       const matching = assistantEvents.filter((evt) => evt.text === "hello");
       expect(matching).toHaveLength(1);
+    });
+  });
+
+  it("emits model.usage diagnostics for non-interactive background runs with nonzero usage", async () => {
+    await withTempHome(async (home) => {
+      const store = path.join(home, "sessions.json");
+      configSpy.mockReturnValue({
+        diagnostics: { enabled: true },
+        models: {
+          providers: {
+            openai: {
+              baseUrl: "https://api.openai.com/v1",
+              models: [
+                {
+                  id: "gpt-5.2",
+                  name: "GPT-5.2",
+                  reasoning: true,
+                  input: ["text"],
+                  cost: { input: 1_000, output: 2_000, cacheRead: 500, cacheWrite: 250 },
+                  contextWindow: 200_000,
+                  maxTokens: 100_000,
+                },
+              ],
+            },
+          },
+        },
+        agents: {
+          defaults: {
+            model: { primary: "anthropic/claude-opus-4-5" },
+            models: { "anthropic/claude-opus-4-5": {} },
+            contextTokens: 8_192,
+            workspace: path.join(home, "openclaw"),
+          },
+        },
+        session: { store, mainKey: "main" },
+      } as OpenClawConfig);
+
+      vi.mocked(runEmbeddedPiAgent).mockResolvedValueOnce({
+        payloads: [{ text: "usage-aware reply" }],
+        meta: {
+          durationMs: 42,
+          agentMeta: {
+            sessionId: "session-bg-usage",
+            provider: "openai",
+            model: "gpt-5.2",
+            usage: {
+              input: 120,
+              output: 33,
+              cacheRead: 10,
+              cacheWrite: 2,
+              total: 165,
+            },
+            lastCallUsage: {
+              input: 120,
+              output: 33,
+              total: 153,
+            },
+          },
+        },
+      } as never);
+
+      const events: Array<{ type: string; [key: string]: unknown }> = [];
+      resetDiagnosticEventsForTest();
+      const stop = onDiagnosticEvent((evt) => {
+        events.push(evt as { type: string; [key: string]: unknown });
+      });
+
+      try {
+        await agentCommand(
+          {
+            message: "check usage telemetry",
+            sessionKey: "agent:main:subagent:usage-telemetry-test",
+          },
+          runtime,
+        );
+      } finally {
+        stop();
+      }
+
+      const usageEvents = events.filter((evt) => evt.type === "model.usage");
+      expect(usageEvents).toHaveLength(1);
+      expect(usageEvents[0]).toEqual(
+        expect.objectContaining({
+          type: "model.usage",
+          sessionKey: "agent:main:subagent:usage-telemetry-test",
+          provider: "openai",
+          model: "gpt-5.2",
+          durationMs: expect.any(Number),
+          costUsd: expect.any(Number),
+          context: expect.objectContaining({
+            limit: 8_192,
+            used: 153,
+          }),
+          usage: expect.objectContaining({
+            input: 120,
+            output: 33,
+            cacheRead: 10,
+            cacheWrite: 2,
+            total: 165,
+          }),
+          lastCallUsage: expect.objectContaining({
+            input: 120,
+            output: 33,
+            total: 153,
+          }),
+        }),
+      );
+      expect(usageEvents[0]).toHaveProperty("channel", undefined);
+
+      resetDiagnosticEventsForTest();
+    });
+  });
+
+  it("uses promptTokens for context.used when lastCallUsage is unavailable", async () => {
+    await withTempHome(async (home) => {
+      const store = path.join(home, "sessions.json");
+      configSpy.mockReturnValue({
+        diagnostics: { enabled: true },
+        models: { providers: {} },
+        agents: {
+          defaults: {
+            model: { primary: "anthropic/claude-opus-4-5" },
+            models: { "anthropic/claude-opus-4-5": {} },
+            contextTokens: 8_192,
+            workspace: path.join(home, "openclaw"),
+          },
+        },
+        session: { store, mainKey: "main" },
+      } as OpenClawConfig);
+
+      vi.mocked(runEmbeddedPiAgent).mockResolvedValueOnce({
+        payloads: [{ text: "prompt token reply" }],
+        meta: {
+          durationMs: 42,
+          agentMeta: {
+            sessionId: "session-bg-prompt-tokens",
+            provider: "openai",
+            model: "gpt-5.2",
+            promptTokens: 420,
+            usage: {
+              input: 1_200,
+              output: 33,
+              cacheRead: 10,
+              cacheWrite: 2,
+              total: 1_245,
+            },
+          },
+        },
+      } as never);
+
+      const events: Array<{ type: string; [key: string]: unknown }> = [];
+      resetDiagnosticEventsForTest();
+      const stop = onDiagnosticEvent((evt) => {
+        events.push(evt as { type: string; [key: string]: unknown });
+      });
+
+      try {
+        await agentCommand(
+          {
+            message: "check prompt token telemetry",
+            sessionKey: "agent:main:subagent:prompt-token-telemetry-test",
+          },
+          runtime,
+        );
+      } finally {
+        stop();
+      }
+
+      const usageEvents = events.filter((evt) => evt.type === "model.usage");
+      expect(usageEvents).toHaveLength(1);
+      expect(usageEvents[0]).toEqual(
+        expect.objectContaining({
+          context: expect.objectContaining({
+            limit: 8_192,
+            used: 420,
+          }),
+          usage: expect.objectContaining({
+            promptTokens: 420,
+            total: 1_245,
+          }),
+        }),
+      );
+
+      resetDiagnosticEventsForTest();
+    });
+  });
+
+  it("emits model.usage with channel attribution when replyChannel is provided", async () => {
+    await withTempHome(async (home) => {
+      const store = path.join(home, "sessions.json");
+      configSpy.mockReturnValue({
+        diagnostics: { enabled: true },
+        models: { providers: {} },
+        agents: {
+          defaults: {
+            model: { primary: "anthropic/claude-opus-4-5" },
+            models: { "anthropic/claude-opus-4-5": {} },
+            workspace: path.join(home, "openclaw"),
+          },
+        },
+        session: { store, mainKey: "main" },
+      } as OpenClawConfig);
+
+      vi.mocked(runEmbeddedPiAgent).mockResolvedValueOnce({
+        payloads: [{ text: "reply" }],
+        meta: {
+          durationMs: 10,
+          agentMeta: {
+            sessionId: "session-channel-test",
+            provider: "anthropic",
+            model: "claude-opus-4-5",
+            usage: { input: 50, output: 20, total: 70 },
+          },
+        },
+      } as never);
+
+      const events: Array<{ type: string; [key: string]: unknown }> = [];
+      resetDiagnosticEventsForTest();
+      const stop = onDiagnosticEvent((evt) => {
+        events.push(evt as { type: string; [key: string]: unknown });
+      });
+
+      try {
+        await agentCommand(
+          {
+            message: "channel test",
+            sessionKey: "agent:main:telegram:channel-test",
+            replyChannel: "telegram",
+          },
+          runtime,
+        );
+      } finally {
+        stop();
+      }
+
+      const usageEvents = events.filter((evt) => evt.type === "model.usage");
+      expect(usageEvents).toHaveLength(1);
+      expect(usageEvents[0]).toHaveProperty("channel", "telegram");
+
+      resetDiagnosticEventsForTest();
+    });
+  });
+
+  it("falls back to session entry lastChannel when messageChannel is not resolved", async () => {
+    await withTempHome(async (home) => {
+      const store = path.join(home, "sessions.json");
+      const sessionKey = "agent:main:discord:stored-channel-test";
+      // Pre-populate session store with lastChannel (set by updateLastRoute)
+      fs.writeFileSync(
+        store,
+        JSON.stringify({
+          [sessionKey]: {
+            sessionId: "session-stored-channel",
+            lastChannel: "discord",
+            updatedAt: Date.now(),
+          },
+        }),
+      );
+
+      configSpy.mockReturnValue({
+        diagnostics: { enabled: true },
+        models: { providers: {} },
+        agents: {
+          defaults: {
+            model: { primary: "anthropic/claude-opus-4-5" },
+            models: { "anthropic/claude-opus-4-5": {} },
+            workspace: path.join(home, "openclaw"),
+          },
+        },
+        session: { store, mainKey: "main" },
+      } as OpenClawConfig);
+
+      vi.mocked(runEmbeddedPiAgent).mockResolvedValueOnce({
+        payloads: [{ text: "reply" }],
+        meta: {
+          durationMs: 10,
+          agentMeta: {
+            sessionId: "session-stored-channel",
+            provider: "anthropic",
+            model: "claude-opus-4-5",
+            usage: { input: 50, output: 20, total: 70 },
+          },
+        },
+      } as never);
+
+      const events: Array<{ type: string; [key: string]: unknown }> = [];
+      resetDiagnosticEventsForTest();
+      const stop = onDiagnosticEvent((evt) => {
+        events.push(evt as { type: string; [key: string]: unknown });
+      });
+
+      try {
+        await agentCommand(
+          {
+            message: "stored channel test",
+            sessionKey,
+            // no replyChannel or channel — should fall back to session entry
+          },
+          runtime,
+        );
+      } finally {
+        stop();
+      }
+
+      const usageEvents = events.filter((evt) => evt.type === "model.usage");
+      expect(usageEvents).toHaveLength(1);
+      expect(usageEvents[0]).toHaveProperty("channel", "discord");
+
+      resetDiagnosticEventsForTest();
+    });
+  });
+
+  it("emits model.usage using sessionId as fallback when no sessionKey is available", async () => {
+    await withTempHome(async (home) => {
+      const store = path.join(home, "sessions.json");
+      configSpy.mockReturnValue({
+        diagnostics: { enabled: true },
+        models: { providers: {} },
+        agents: {
+          defaults: {
+            model: { primary: "anthropic/claude-opus-4-5" },
+            models: { "anthropic/claude-opus-4-5": {} },
+            contextTokens: 4_096,
+            workspace: path.join(home, "openclaw"),
+          },
+        },
+        session: { store, mainKey: "main" },
+      } as OpenClawConfig);
+
+      vi.mocked(runEmbeddedPiAgent).mockResolvedValueOnce({
+        payloads: [{ text: "reply" }],
+        meta: {
+          durationMs: 10,
+          agentMeta: {
+            sessionId: "session-no-key-fallback",
+            provider: "anthropic",
+            model: "claude-opus-4-5",
+            usage: { input: 50, output: 20, total: 70 },
+          },
+        },
+      } as never);
+
+      const events: Array<{ type: string; [key: string]: unknown }> = [];
+      resetDiagnosticEventsForTest();
+      const stop = onDiagnosticEvent((evt) => {
+        events.push(evt as { type: string; [key: string]: unknown });
+      });
+
+      try {
+        await agentCommand(
+          {
+            message: "no key run",
+            sessionId: "session-no-key-fallback",
+            // no sessionKey provided
+          },
+          runtime,
+        );
+      } finally {
+        stop();
+      }
+
+      const usageEvents = events.filter((evt) => evt.type === "model.usage");
+      expect(usageEvents).toHaveLength(1);
+      expect(usageEvents[0]).toEqual(
+        expect.objectContaining({
+          type: "model.usage",
+          sessionKey: "session-no-key-fallback",
+          sessionId: "session-no-key-fallback",
+          provider: "anthropic",
+          model: "claude-opus-4-5",
+          usage: expect.objectContaining({
+            input: 50,
+            output: 20,
+            total: 70,
+          }),
+        }),
+      );
+
+      resetDiagnosticEventsForTest();
     });
   });
 

@@ -43,6 +43,7 @@ import {
   emitAgentEvent,
   registerAgentRunContext,
 } from "../infra/agent-events.js";
+import { emitDiagnosticEvent, isDiagnosticsEnabled } from "../infra/diagnostic-events.js";
 import { buildOutboundSessionContext } from "../infra/outbound/session-context.js";
 import { getRemoteSkillEligibility } from "../infra/skills-remote.js";
 import { normalizeAgentId } from "../routing/session-key.js";
@@ -53,6 +54,7 @@ import { resolveSendPolicy } from "../sessions/send-policy.js";
 import { emitSessionTranscriptUpdate } from "../sessions/transcript-events.js";
 import { sanitizeForLog } from "../terminal/ansi.js";
 import { resolveMessageChannel } from "../utils/message-channel.js";
+import { estimateUsageCost, resolveModelCostConfig } from "../utils/usage-format.js";
 import {
   listAgentIds,
   resolveAgentDir,
@@ -71,7 +73,8 @@ import { resolveAgentRunContext } from "./command/run-context.js";
 import { updateSessionStoreAfterAgentRun } from "./command/session-store.js";
 import { resolveSession } from "./command/session.js";
 import type { AgentCommandIngressOpts, AgentCommandOpts } from "./command/types.js";
-import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults.js";
+import { resolveContextTokensForModel } from "./context.js";
+import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults.js";
 import { FailoverError } from "./failover-error.js";
 import { formatAgentInternalEventsForPrompt } from "./internal-events.js";
 import { AGENT_LANE_SUBAGENT } from "./lanes.js";
@@ -94,6 +97,7 @@ import { buildWorkspaceSkillSnapshot } from "./skills.js";
 import { getSkillsSnapshotVersion } from "./skills/refresh.js";
 import { normalizeSpawnedRunMetadata } from "./spawned-context.js";
 import { resolveAgentTimeoutMs } from "./timeout.js";
+import { hasNonzeroUsage } from "./usage.js";
 import { ensureAgentWorkspace } from "./workspace.js";
 
 type PersistSessionEntryParams = {
@@ -1152,9 +1156,10 @@ async function agentCommandInternal(
     let result: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
     let fallbackProvider = provider;
     let fallbackModel = model;
+    let messageChannel: ReturnType<typeof resolveMessageChannel> | undefined;
     try {
       const runContext = resolveAgentRunContext(opts);
-      const messageChannel = resolveMessageChannel(
+      messageChannel = resolveMessageChannel(
         runContext.messageChannel,
         opts.replyChannel ?? opts.channel,
       );
@@ -1270,6 +1275,122 @@ async function agentCommandInternal(
         fallbackModel,
         result,
       });
+    }
+
+    const usage = result.meta.agentMeta?.usage;
+    const lastCallUsage = result.meta.agentMeta?.lastCallUsage;
+    const promptTokensSnapshot = result.meta.agentMeta?.promptTokens;
+    const hasPromptTokensSnapshot =
+      typeof promptTokensSnapshot === "number" &&
+      Number.isFinite(promptTokensSnapshot) &&
+      promptTokensSnapshot > 0;
+    if (
+      isDiagnosticsEnabled(cfg) &&
+      (hasNonzeroUsage(usage) || lastCallUsage || hasPromptTokensSnapshot)
+    ) {
+      const input = usage?.input ?? 0;
+      const output = usage?.output ?? 0;
+      const cacheRead = usage?.cacheRead ?? 0;
+      const cacheWrite = usage?.cacheWrite ?? 0;
+      // Issue F fix: when `usage` is absent/zero but `lastCallUsage` has real counts (e.g. a
+      // provider that supplies per-call snapshots but omits aggregate totals), derive
+      // `promptTokens` and `total` from lastCallUsage so OTEL token metrics are non-zero.
+      const lastCallInput = lastCallUsage?.input ?? 0;
+      const lastCallOutput = lastCallUsage?.output ?? 0;
+      const lastCallCacheRead = lastCallUsage?.cacheRead ?? 0;
+      const lastCallCacheWrite = lastCallUsage?.cacheWrite ?? 0;
+      const promptTokens =
+        promptTokensSnapshot ??
+        (input + cacheRead + cacheWrite > 0
+          ? input + cacheRead + cacheWrite
+          : lastCallInput + lastCallCacheRead + lastCallCacheWrite > 0
+            ? lastCallInput + lastCallCacheRead + lastCallCacheWrite
+            : 0);
+      const totalTokens =
+        usage?.total ??
+        lastCallUsage?.total ??
+        (promptTokens + output > 0
+          ? promptTokens + output
+          : lastCallInput + lastCallCacheRead + lastCallCacheWrite + lastCallOutput > 0
+            ? lastCallInput + lastCallCacheRead + lastCallCacheWrite + lastCallOutput
+            : undefined);
+      const providerUsed = result.meta.agentMeta?.provider ?? fallbackProvider ?? provider;
+      const modelUsed = result.meta.agentMeta?.model ?? fallbackModel ?? model;
+      const contextTokensUsed =
+        resolveContextTokensForModel({
+          cfg,
+          provider: providerUsed,
+          model: modelUsed,
+          contextTokensOverride: agentCfg?.contextTokens,
+          fallbackContextTokens: DEFAULT_CONTEXT_TOKENS,
+        }) ?? DEFAULT_CONTEXT_TOKENS;
+      const costUsd = estimateUsageCost({
+        usage,
+        cost: resolveModelCostConfig({ provider: providerUsed, model: modelUsed, config: cfg }),
+      });
+      // Issue B fix: compute lastCallPromptTokens from input+cacheRead+cacheWrite (context-size
+      // metric), not input+output. Counting output tokens overstates context and drops cache
+      // tokens for providers that omit `total` but supply `cacheRead`/`cacheWrite`.
+      const lastCallPromptTokens =
+        lastCallUsage?.total ??
+        (lastCallUsage
+          ? (lastCallUsage.input ?? 0) +
+            (lastCallUsage.cacheRead ?? 0) +
+            (lastCallUsage.cacheWrite ?? 0)
+          : undefined);
+      // Issue A fix: prefer promptTokensSnapshot (populated from attemptUsage before tool loops
+      // accumulate) over totalTokens which overstates context for background runs.
+      const contextUsed = lastCallPromptTokens ?? promptTokensSnapshot ?? promptTokens;
+      const diagnosticPayload = {
+        type: "model.usage" as const,
+        sessionKey: sessionKey ?? sessionId,
+        sessionId,
+        provider: providerUsed,
+        model: modelUsed,
+        usage: {
+          input,
+          output,
+          cacheRead,
+          cacheWrite,
+          promptTokens,
+          total: totalTokens,
+        },
+        lastCallUsage,
+        context: {
+          limit: contextTokensUsed,
+          used: contextUsed,
+        },
+        costUsd,
+        durationMs: Date.now() - startedAt,
+      };
+
+      const payloads = result.payloads ?? [];
+      // Issue C fix: capture the resolved delivery channel for accurate OTEL attribution.
+      // Issue G fix: always emit diagnostics even when delivery throws (e.g. unknown channel,
+      // missing target). Use try/finally so token telemetry is never silently dropped on
+      // delivery errors — emit with the best channel info available, then rethrow.
+      let deliveryResult: Awaited<ReturnType<typeof deliverAgentCommandResult>> | undefined =
+        undefined;
+      try {
+        deliveryResult = await deliverAgentCommandResult({
+          cfg,
+          deps,
+          runtime,
+          opts,
+          outboundSession,
+          sessionEntry,
+          result,
+          payloads,
+        });
+      } finally {
+        const resolvedChannel =
+          deliveryResult?.resolvedChannel ??
+          messageChannel ??
+          sessionEntry?.lastChannel ??
+          sessionEntry?.channel;
+        emitDiagnosticEvent({ ...diagnosticPayload, channel: resolvedChannel });
+      }
+      return deliveryResult;
     }
 
     const payloads = result.payloads ?? [];
